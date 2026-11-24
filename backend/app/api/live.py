@@ -95,14 +95,20 @@ async def websocket_live_feed(websocket: WebSocket, token: Optional[str] = Query
 
     await websocket.accept()
     settings = get_settings()
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe(settings.LIVE_EVENTS_CHANNEL)
+    pubsub = None
+    redis_client = None
+    try:
+        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True, socket_connect_timeout=1.5)
+        await redis_client.ping()
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(settings.LIVE_EVENTS_CHANNEL)
+    except Exception:
+        pubsub = None
 
     await websocket.send_json(
         {
             "type": "connection.ready",
-            "channel": settings.LIVE_EVENTS_CHANNEL,
+            "channel": settings.LIVE_EVENTS_CHANNEL if pubsub else "serverless-fallback",
             "server_time": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -110,27 +116,29 @@ async def websocket_live_feed(websocket: WebSocket, token: Optional[str] = Query
     try:
         while True:
             try:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg and msg.get("data"):
-                    await websocket.send_text(str(msg["data"]))
+                if pubsub is not None:
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if msg and msg.get("data"):
+                        await websocket.send_text(str(msg["data"]))
                 else:
-                    # Drain optional client keepalive messages without blocking
-                    try:
-                        await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
-                    except asyncio.TimeoutError:
-                        pass
+                    await asyncio.sleep(2.0)
+                try:
+                    await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass
             except WebSocketDisconnect:
                 break
             except Exception as exc:
                 logger.debug("WebSocket loop notice: %s", exc)
                 await asyncio.sleep(0.5)
     finally:
-        try:
-            await pubsub.unsubscribe(settings.LIVE_EVENTS_CHANNEL)
-            await pubsub.aclose()
-            await redis_client.aclose()
-        except Exception:
-            pass
+        if pubsub is not None and redis_client is not None:
+            try:
+                await pubsub.unsubscribe(settings.LIVE_EVENTS_CHANNEL)
+                await pubsub.aclose()
+                await redis_client.aclose()
+            except Exception:
+                pass
 
 
 @router.get("/api/v1/live/stream")
@@ -142,28 +150,40 @@ async def sse_live_stream(token: Optional[str] = Query(default=None)):
     settings = get_settings()
 
     async def event_generator():
-        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-        pubsub = redis_client.pubsub()
-        await pubsub.subscribe(settings.LIVE_EVENTS_CHANNEL)
+        pubsub = None
+        redis_client = None
+        try:
+            redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True, socket_connect_timeout=1.5)
+            await redis_client.ping()
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe(settings.LIVE_EVENTS_CHANNEL)
+        except Exception:
+            pubsub = None
+
         try:
             yield f"event: ready\ndata: {json.dumps({'status': 'connected', 'server_time': datetime.now(timezone.utc).isoformat()})}\n\n"
             ticks = 0
             while True:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg and msg.get("data"):
-                    yield f"event: record\ndata: {msg['data']}\n\n"
+                if pubsub is not None:
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if msg and msg.get("data"):
+                        yield f"event: record\ndata: {msg['data']}\n\n"
+                    else:
+                        ticks += 1
+                        if ticks % 15 == 0:
+                            yield f"event: heartbeat\ndata: {json.dumps({'ts': datetime.now(timezone.utc).isoformat()})}\n\n"
                 else:
-                    ticks += 1
-                    if ticks % 15 == 0:
-                        yield f"event: heartbeat\ndata: {json.dumps({'ts': datetime.now(timezone.utc).isoformat()})}\n\n"
+                    await asyncio.sleep(5.0)
+                    yield f"event: heartbeat\ndata: {json.dumps({'ts': datetime.now(timezone.utc).isoformat()})}\n\n"
                 await asyncio.sleep(0.1)
         finally:
-            try:
-                await pubsub.unsubscribe(settings.LIVE_EVENTS_CHANNEL)
-                await pubsub.close()
-                await redis_client.aclose()
-            except Exception:
-                pass
+            if pubsub is not None and redis_client is not None:
+                try:
+                    await pubsub.unsubscribe(settings.LIVE_EVENTS_CHANNEL)
+                    await pubsub.aclose()
+                    await redis_client.aclose()
+                except Exception:
+                    pass
 
     return StreamingResponse(
         event_generator(),
