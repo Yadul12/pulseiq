@@ -27,3 +27,6 @@ data/synthetic_public_discussions_52k.csv.gz
 # OS / Editor
 .DS_Store
 Thumbs.db
+
+.vercel
+.env*

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+data/synthetic_public_discussions_52k.csv.gz
+.env
+.env.*
+!.env.example
+backend/tests/
