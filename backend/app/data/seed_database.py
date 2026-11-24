@@ -127,18 +127,19 @@ INITIAL_MONITORING_TOPICS = [
 ]
 
 
-def seed_database() -> None:
+def seed_database(record_count_override: int | None = None) -> None:
     settings = get_settings()
+    target_count = record_count_override or settings.SEED_RECORD_COUNT
     t0 = time.time()
     db: Session = SessionLocal()
     try:
         existing_raw = db.scalar(select(func.count(RawRecord.id))) or 0
-        if existing_raw >= 50000:
+        if existing_raw >= min(target_count, 50000):
             logger.info("PulseIQ database already seeded with %s raw records. Skipping re-seed.", f"{existing_raw:,}")
             return
 
         now = datetime.now(timezone.utc)
-        logger.info("Starting PulseIQ enterprise seed (%s synthetic records)...", f"{settings.SEED_RECORD_COUNT:,}")
+        logger.info("Starting PulseIQ enterprise seed (%s synthetic records)...", f"{target_count:,}")
 
         # 1. Seed Users
         users_spec = [
@@ -214,9 +215,10 @@ def seed_database() -> None:
                 db.flush()
             topic_by_name[mt.name] = mt
 
-        # 4. Generate 52,000 reproducible synthetic records & export CSV archive
-        records = generate_synthetic_records(total_count=settings.SEED_RECORD_COUNT, now=now)
-        archive_path, sample_csv_path = export_reproducible_datasets(settings.DATA_DIR, records)
+        # 4. Generate reproducible synthetic records & export CSV archive
+        data_dir = "/tmp/pulseiq_data" if str(db.bind.url).startswith("sqlite") else settings.DATA_DIR
+        records = generate_synthetic_records(total_count=target_count, now=now)
+        archive_path, sample_csv_path = export_reproducible_datasets(data_dir, records)
         logger.info("Exported reproducible archive (%s) and prepared CSV (%s)", archive_path, sample_csv_path)
 
         # Create initial backfill ingestion jobs per source

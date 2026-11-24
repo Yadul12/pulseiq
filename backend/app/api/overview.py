@@ -132,7 +132,12 @@ def get_overview_dashboard(
 
     # Topic activity over time (daily buckets by effective topic)
     eff_topic = _eff_topic_expr()
-    day_expr = func.date_trunc("day", RawRecord.published_at)
+    is_sqlite = db.bind is not None and db.bind.dialect.name == "sqlite"
+    day_expr = (
+        func.strftime("%Y-%m-%d", RawRecord.published_at)
+        if is_sqlite
+        else func.date_trunc("day", RawRecord.published_at)
+    )
     trend_rows = db.execute(
         select(day_expr.label("day"), eff_topic.label("topic"), func.count(ProcessedRecord.id).label("cnt"))
         .join(ProcessedRecord, ProcessedRecord.id == TopicClassification.processed_record_id)
@@ -145,7 +150,7 @@ def get_overview_dashboard(
     daily_map: dict[str, dict[str, int | str]] = {}
     topic_totals: Counter[str] = Counter()
     for day_dt, topic_name, cnt in trend_rows:
-        d_str = day_dt.strftime("%Y-%m-%d")
+        d_str = str(day_dt)[:10] if isinstance(day_dt, str) else day_dt.strftime("%Y-%m-%d")
         if d_str not in daily_map:
             daily_map[d_str] = {"date": d_str, "total": 0}
         daily_map[d_str][topic_name] = int(cnt)

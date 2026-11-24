@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import redis
@@ -13,7 +14,7 @@ from sqlalchemy import func, select, text
 
 from app.api import auth, events, live, overview, records, reports, sources, topics
 from app.core.config import get_settings
-from app.core.database import SessionLocal
+from app.core.database import Base, SessionLocal, engine
 from app.models.models import ProcessedRecord, RawRecord
 from app.nlp.pipeline import get_nlp_pipeline
 
@@ -27,6 +28,12 @@ settings = get_settings()
 async def lifespan(_app: FastAPI):
     # Warm up calibrated scikit-learn NLP pipeline on startup for instant low-latency inference
     get_nlp_pipeline()
+    if os.environ.get("VERCEL") == "1":
+        Base.metadata.create_all(bind=engine)
+        from app.data.seed_database import seed_database
+
+        vercel_seed_count = int(os.environ.get("VERCEL_SEED_COUNT", "4000"))
+        seed_database(record_count_override=vercel_seed_count)
     logger.info("PulseIQ API started cleanly (version %s).", settings.APP_VERSION)
     yield
 
