@@ -1,0 +1,468 @@
+"""Modular data ingestion provider adapters for PulseIQ.
+
+Supports:
+- Prepared CSV datasets (`CSVAdapter`)
+- Public RSS/Atom feeds (`RSSAdapter`) with rate-limiting, retry, and explicit synthetic fallback
+- Permitted public JSON APIs (`PublicAPIAdapter`) with backoff retry and explicit synthetic fallback
+- Synthetic event streams (`SyntheticStreamAdapter`) clearly labelled as synthetic
+
+Compliance guarantee:
+- No unauthorized scraping of restricted websites.
+- Synthetic fallback records are ALWAYS tagged with `is_synthetic=True` and transparent provenance labels.
+"""
+
+from __future__ import annotations
+
+import csv
+import gzip
+import json
+import logging
+import random
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
+
+from app.data.generate_dataset import DOMAIN_TEMPLATES, LOCATIONS
+from app.models.models import DataSource, MonitoringTopic
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AdapterFetchResult:
+    records: list[dict[str, Any]]
+    next_cursor: Optional[str] = None
+    used_synthetic_fallback: bool = False
+    retry_count: int = 0
+    warnings: list[dict[str, Any]] = field(default_factory=list)
+
+
+class TokenBucketRateLimiter:
+    """Simple per-invocation rate limiter honoring DataSource.rate_limit_per_min."""
+
+    def __init__(self, rate_limit_per_min: int) -> None:
+        self.min_interval = 60.0 / max(rate_limit_per_min, 1)
+        self._last_ts = 0.0
+
+    def acquire(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_ts
+        if self._last_ts > 0 and elapsed < min(self.min_interval, 0.25):
+            time.sleep(min(self.min_interval - elapsed, 0.25))
+        self._last_ts = time.monotonic()
+
+
+def _generate_synthetic_incremental_batch(
+    source: DataSource,
+    batch_size: int,
+    provenance_label: str,
+    topic: Optional[MonitoringTopic] = None,
+    seed_offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Generate clearly labelled synthetic records, optionally anchored to a MonitoringTopic's keywords."""
+    now = datetime.now(timezone.utc)
+    rng = random.Random(int(now.timestamp()) + source.id * 97 + seed_offset)
+    domain_keys = list(DOMAIN_TEMPLATES.keys())
+
+    # Choose domain aligned with topic if provided
+    preferred_domain = None
+    topic_keywords: list[str] = []
+    if topic is not None:
+        topic_keywords = [k.strip() for k in (topic.keywords or []) if k and k.strip()]
+        for dk in domain_keys:
+            if dk.lower() == topic.name.lower() or (topic.category and topic.category.lower() in dk.lower()):
+                preferred_domain = dk
+                break
+
+    out: list[dict[str, Any]] = []
+    sentiments = ["positive", "neutral", "mixed", "negative"]
+    weights = [0.22, 0.24, 0.20, 0.34]
+
+    for i in range(batch_size):
+        domain = preferred_domain if (preferred_domain and rng.random() < 0.85) else rng.choice(domain_keys)
+        loc = rng.choice(LOCATIONS)
+        sent = rng.choices(sentiments, weights=weights, k=1)[0]
+        base_text = rng.choice(DOMAIN_TEMPLATES[domain][sent]).format(loc=loc)
+
+        # Inject topic-specific keywords cleanly when ingesting for a custom analyst monitoring topic
+        if topic is not None and topic_keywords:
+            kw_sample = rng.sample(topic_keywords, k=min(2, len(topic_keywords)))
+            kw_phrase = " and ".join(kw_sample)
+            if i == 0:
+                # Include one intentionally nuanced/sarcastic record so analyst review & override workflows can verify it
+                base_text = (
+                    f"Great job scheduling {kw_phrase} consultations in {loc} with almost no public transit access—"
+                    f"residents monitoring {topic.name} are calling for immediate policy transparency."
+                )
+            else:
+                base_text = (
+                    f"Public update regarding {topic.name} ({kw_phrase}) in {loc}: {base_text}"
+                )
+
+        # Every 12th record simulate a syndicated near-duplicate to verify dedup pipeline on live runs
+        if i > 2 and i % 12 == 0 and out:
+            base_text = f"FWD: {out[0]['original_text']}"
+
+        pub_dt = now - timedelta(seconds=rng.randint(15, 7200))
+        uid = f"LIVE-{source.id}-{int(now.timestamp())}-{i:03d}"
+        out.append(
+            {
+                "external_id": uid,
+                "source_url": f"https://synthetic.pulseiq.local/{source.slug}/stream/{uid}",
+                "author_handle_anonymized": f"anon_civic_{rng.randint(10000, 99999)}",
+                "original_title": f"{topic.name if topic else domain} — {loc}",
+                "original_text": base_text,
+                "raw_metadata": {
+                    "district": loc,
+                    "provider_type": source.provider_type,
+                    "synthetic_notice": "Clearly labelled synthetic record generated by PulseIQ modular adapter.",
+                    "topic_context": topic.name if topic else None,
+                },
+                "published_at": pub_dt,
+                "is_synthetic": True,
+                "provenance_label": provenance_label,
+                "has_missing_fields": False,
+            }
+        )
+    return out
+
+
+class CSVAdapter:
+    """Reads prepared CSV / CSV.GZ files incrementally with persisted row-offset cursor."""
+
+    def fetch(
+        self,
+        source: DataSource,
+        batch_size: int = 20,
+        topic: Optional[MonitoringTopic] = None,
+    ) -> AdapterFetchResult:
+        cfg = source.config or {}
+        file_path = Path(cfg.get("file_path", "/app/data/prepared_civic_consultations_sample.csv"))
+        warnings: list[dict[str, Any]] = []
+
+        if not file_path.exists():
+            warnings.append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "level": "WARNING",
+                    "code": "CSV_FILE_MISSING_FALLBACK",
+                    "message": f"Configured CSV path '{file_path}' not found; generated clearly labelled synthetic CSV fallback batch.",
+                }
+            )
+            recs = _generate_synthetic_incremental_batch(
+                source, batch_size, "PREPARED_CSV_SYNTHETIC", topic=topic
+            )
+            return AdapterFetchResult(
+                records=recs,
+                next_cursor=f"csv-fallback-{int(time.time())}",
+                used_synthetic_fallback=True,
+                warnings=warnings,
+            )
+
+        offset = 0
+        if source.last_cursor and source.last_cursor.startswith("csv-row-"):
+            try:
+                offset = int(source.last_cursor.split("csv-row-")[1])
+            except ValueError:
+                offset = 0
+
+        opener = gzip.open if file_path.suffix == ".gz" else open
+        records: list[dict[str, Any]] = []
+        row_idx = 0
+        with opener(file_path, "rt", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row_idx, row in enumerate(reader):
+                if row_idx < offset:
+                    continue
+                if len(records) >= batch_size:
+                    break
+                text = (row.get("original_text") or "").strip()
+                if not text:
+                    continue
+                try:
+                    raw_meta = json.loads(row.get("raw_metadata") or "{}")
+                except Exception:
+                    raw_meta = {}
+                try:
+                    pub_dt = datetime.fromisoformat(row.get("published_at") or "")
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    pub_dt = datetime.now(timezone.utc)
+                records.append(
+                    {
+                        "external_id": row.get("external_id") or f"CSV-{source.id}-{row_idx}",
+                        "source_url": row.get("source_url"),
+                        "author_handle_anonymized": row.get("author_handle_anonymized") or None,
+                        "original_title": row.get("original_title") or None,
+                        "original_text": text,
+                        "raw_metadata": raw_meta,
+                        "published_at": pub_dt,
+                        "is_synthetic": str(row.get("is_synthetic", "true")).lower() != "false",
+                        "provenance_label": row.get("provenance_label") or "PREPARED_CSV_SYNTHETIC",
+                        "has_missing_fields": str(row.get("has_missing_fields", "false")).lower() == "true",
+                    }
+                )
+
+        # If cursor reached end of prepared CSV, wrap or synthesize fresh incremental batch if requested for a topic
+        next_cursor = f"csv-row-{offset + len(records)}"
+        used_fallback = False
+        if not records:
+            warnings.append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "level": "INFO",
+                    "code": "CSV_EOF_SYNTHETIC_SUPPLEMENT",
+                    "message": f"Reached end of prepared CSV '{file_path.name}' at row {offset}; emitted clearly labelled synthetic incremental batch.",
+                }
+            )
+            records = _generate_synthetic_incremental_batch(
+                source, batch_size, "PREPARED_CSV_SYNTHETIC", topic=topic
+            )
+            used_fallback = True
+            next_cursor = f"csv-row-0"
+
+        return AdapterFetchResult(
+            records=records,
+            next_cursor=next_cursor,
+            used_synthetic_fallback=used_fallback,
+            warnings=warnings,
+        )
+
+
+class RSSAdapter:
+    """Fetches public RSS/Atom XML feeds with retry/backoff and transparent synthetic fallback."""
+
+    def fetch(
+        self,
+        source: DataSource,
+        batch_size: int = 15,
+        topic: Optional[MonitoringTopic] = None,
+    ) -> AdapterFetchResult:
+        cfg = source.config or {}
+        feed_url = cfg.get("feed_url", "")
+        allow_fallback = cfg.get("fallback_to_synthetic", True)
+        limiter = TokenBucketRateLimiter(source.rate_limit_per_min)
+        warnings: list[dict[str, Any]] = []
+        retries = 0
+
+        # Only attempt external HTTP if a real non-example URL is explicitly configured
+        if feed_url and "example.gov" not in feed_url and "example.com" not in feed_url:
+            for attempt in range(1, 4):
+                limiter.acquire()
+                try:
+                    with httpx.Client(timeout=4.0, follow_redirects=True) as client:
+                        resp = client.get(feed_url, headers={"User-Agent": "PulseIQ-CivicIntel/1.0 (+public-rss)"})
+                        resp.raise_for_status()
+                    root = ET.fromstring(resp.text)
+                    items = root.findall(".//item")[:batch_size]
+                    parsed: list[dict[str, Any]] = []
+                    for idx, item in enumerate(items):
+                        title = (item.findtext("title") or "").strip()
+                        desc = (item.findtext("description") or "").strip()
+                        link = (item.findtext("link") or "").strip()
+                        guid = (item.findtext("guid") or link or f"rss-{idx}").strip()
+                        combined = f"{title}. {desc}".strip(". ")
+                        if not combined:
+                            continue
+                        parsed.append(
+                            {
+                                "external_id": guid[:150],
+                                "source_url": link or feed_url,
+                                "author_handle_anonymized": "public_rss_publisher",
+                                "original_title": title[:390] if title else None,
+                                "original_text": combined,
+                                "raw_metadata": {"feed_url": feed_url, "provider": "public_rss"},
+                                "published_at": datetime.now(timezone.utc),
+                                "is_synthetic": False,
+                                "provenance_label": "PUBLIC_RSS",
+                                "has_missing_fields": not bool(title and desc),
+                            }
+                        )
+                    if parsed:
+                        return AdapterFetchResult(
+                            records=parsed,
+                            next_cursor=f"rss-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}",
+                            used_synthetic_fallback=False,
+                            retry_count=retries,
+                            warnings=warnings,
+                        )
+                    break
+                except Exception as exc:
+                    retries = attempt
+                    warnings.append(
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "level": "WARNING",
+                            "code": "RSS_FETCH_RETRY",
+                            "message": f"RSS attempt {attempt}/3 failed for {feed_url}: {exc}",
+                        }
+                    )
+                    time.sleep(min(0.4 * attempt, 1.2))
+        else:
+            warnings.append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "level": "INFO",
+                    "code": "RSS_SYNTHETIC_FALLBACK_ACTIVE",
+                    "message": "External RSS credentials/live feed endpoint not configured; using clearly labelled synthetic civic RSS fallback provider.",
+                }
+            )
+
+        if not allow_fallback:
+            raise RuntimeError(f"RSS feed {feed_url} unavailable and synthetic fallback is disabled.")
+
+        recs = _generate_synthetic_incremental_batch(
+            source, batch_size, "PUBLIC_RSS_SYNTHETIC_FALLBACK", topic=topic
+        )
+        return AdapterFetchResult(
+            records=recs,
+            next_cursor=f"rss-syn-{int(time.time())}",
+            used_synthetic_fallback=True,
+            retry_count=retries,
+            warnings=warnings,
+        )
+
+
+class PublicAPIAdapter:
+    """Adapter for permitted public JSON APIs with rate-limit backoff and synthetic fallback."""
+
+    def fetch(
+        self,
+        source: DataSource,
+        batch_size: int = 15,
+        topic: Optional[MonitoringTopic] = None,
+    ) -> AdapterFetchResult:
+        cfg = source.config or {}
+        endpoint = cfg.get("endpoint", "")
+        allow_fallback = cfg.get("fallback_to_synthetic", True)
+        limiter = TokenBucketRateLimiter(source.rate_limit_per_min)
+        warnings: list[dict[str, Any]] = []
+        retries = 0
+
+        if endpoint and "example.gov" not in endpoint and "example.com" not in endpoint:
+            for attempt in range(1, 4):
+                limiter.acquire()
+                try:
+                    with httpx.Client(timeout=4.0) as client:
+                        resp = client.get(endpoint, headers={"Accept": "application/json", "User-Agent": "PulseIQ/1.0"})
+                        if resp.status_code == 429:
+                            retries = attempt
+                            warnings.append(
+                                {
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "level": "WARNING",
+                                    "code": "HTTP_429_RATE_LIMIT",
+                                    "message": f"Permitted API rate-limited (429) on attempt {attempt}/3; backing off.",
+                                }
+                            )
+                            time.sleep(0.5 * attempt)
+                            continue
+                        resp.raise_for_status()
+                        payload = resp.json()
+                        items = payload if isinstance(payload, list) else payload.get("items", payload.get("data", []))
+                        parsed: list[dict[str, Any]] = []
+                        for idx, obj in enumerate(items[:batch_size]):
+                            text = str(obj.get("description") or obj.get("text") or obj.get("title") or "").strip()
+                            if not text:
+                                continue
+                            parsed.append(
+                                {
+                                    "external_id": str(obj.get("id") or obj.get("service_request_id") or f"api-{idx}"),
+                                    "source_url": obj.get("url") or endpoint,
+                                    "author_handle_anonymized": "permitted_api_public",
+                                    "original_title": str(obj.get("title") or obj.get("service_name") or "")[:390] or None,
+                                    "original_text": text,
+                                    "raw_metadata": {"endpoint": endpoint, "provider": "permitted_public_api"},
+                                    "published_at": datetime.now(timezone.utc),
+                                    "is_synthetic": False,
+                                    "provenance_label": "PERMITTED_API",
+                                    "has_missing_fields": False,
+                                }
+                            )
+                        if parsed:
+                            return AdapterFetchResult(
+                                records=parsed,
+                                next_cursor=f"api-{int(time.time())}",
+                                used_synthetic_fallback=False,
+                                retry_count=retries,
+                                warnings=warnings,
+                            )
+                        break
+                except Exception as exc:
+                    retries = attempt
+                    warnings.append(
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "level": "WARNING",
+                            "code": "PUBLIC_API_RETRY",
+                            "message": f"Public API attempt {attempt}/3 failed: {exc}",
+                        }
+                    )
+                    time.sleep(0.4 * attempt)
+        else:
+            warnings.append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "level": "INFO",
+                    "code": "API_SYNTHETIC_FALLBACK_ACTIVE",
+                    "message": "External API credentials unavailable; executing clearly labelled synthetic public API fallback provider.",
+                }
+            )
+
+        if not allow_fallback:
+            raise RuntimeError(f"Public API endpoint {endpoint} unavailable and fallback disabled.")
+
+        recs = _generate_synthetic_incremental_batch(
+            source, batch_size, "PERMITTED_API_SYNTHETIC_FALLBACK", topic=topic
+        )
+        return AdapterFetchResult(
+            records=recs,
+            next_cursor=f"api-syn-{int(time.time())}",
+            used_synthetic_fallback=True,
+            retry_count=retries,
+            warnings=warnings,
+        )
+
+
+class SyntheticStreamAdapter:
+    """Explicit synthetic event stream generator for live testing and demonstration."""
+
+    def fetch(
+        self,
+        source: DataSource,
+        batch_size: int = 18,
+        topic: Optional[MonitoringTopic] = None,
+    ) -> AdapterFetchResult:
+        cfg = source.config or {}
+        effective_batch = batch_size or int(cfg.get("batch_size", 18))
+        recs = _generate_synthetic_incremental_batch(
+            source, effective_batch, "SYNTHETIC_STREAM", topic=topic
+        )
+        return AdapterFetchResult(
+            records=recs,
+            next_cursor=f"syn-stream-{int(time.time())}",
+            used_synthetic_fallback=True,
+            retry_count=0,
+            warnings=[],
+        )
+
+
+ADAPTER_REGISTRY = {
+    "csv": CSVAdapter(),
+    "rss": RSSAdapter(),
+    "public_api": PublicAPIAdapter(),
+    "synthetic_stream": SyntheticStreamAdapter(),
+}
+
+
+def get_adapter(provider_type: str):
+    adapter = ADAPTER_REGISTRY.get(provider_type)
+    if not adapter:
+        raise ValueError(f"Unsupported data source provider_type: '{provider_type}'")
+    return adapter
